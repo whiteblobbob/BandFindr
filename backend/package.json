@@ -1,0 +1,33 @@
+{
+  "name": "bandfindr-backend",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun --env-file=.env.development --watch src/index.ts",
+    "start": "bun --env-file=.env.production src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun --env-file=.env.development test",
+    "db:start": "supabase start",
+    "db:reset": "supabase db reset --local",
+    "db:diff": "drizzle-kit generate",
+    "test:unit": "bun test tests/unit.test.ts",
+    "test:integration": "RUN_INTEGRATION=1 bun --env-file=.env.development test tests/integration.test.ts",
+    "db:seed:demo": "bun --env-file=.env.development seeder/index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "drizzle-kit": "^0.31.11",
+    "supabase": "^3.1.0",
+    "typescript": "^7.0.2"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.119.0",
+    "cloudinary": "^2.11.0",
+    "drizzle-orm": "^0.45.4",
+    "elysia": "^1.4.32",
+    "postgres": "^4.1.1"
+  }
+}
