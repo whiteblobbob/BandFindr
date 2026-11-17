@@ -6,17 +6,26 @@ Bun, Elysia, Drizzle, Supabase Auth/Postgres, and Cloudinary. All API error mess
 
 1. Install Bun and Docker, then start Docker.
 2. Run `bun install` and `bun run db:start` in this directory. Supabase applies migrations and seeds on its first start.
-3. Copy `.env.development.example` to `.env.development`. Run `bunx supabase status` and fill in its local anon key. The template already contains the local database and API URLs.
-4. Add Cloudinary credentials to enable image uploads.
+3. Copy `.env.development.example` to `.env.development`. Run `bunx supabase status` and fill in its local anon and service-role keys. Keep the service-role key server-only. The template already contains the local database and API URLs.
+4. Set `RESEND_API_KEY` and `RESEND_FROM_EMAIL` to a verified Resend sender for registration email. Development sends through Resend too; no email is sent to the local inbox by this flow. Add Cloudinary credentials to enable image uploads.
 5. Run `bun run dev`. The API listens on port 3000. Studio uses port 55423 and the local email inbox uses port 55424.
 
 Use `bun run db:reset` to recreate the **local development database**, apply migrations, and seed catalogs. This deletes its existing data.
 
 ## Authentication and requests
 
-Send JSON bodies and `Authorization: Bearer <access_token>` on protected endpoints. Signup requires `email`, `password`, `name`, `province`, `city`, and `date_of_birth` (`YYYY-MM-DD`). Passwords must contain 8–128 characters. Birth dates must be between 1900-01-01 and today.
+Send JSON bodies and `Authorization: Bearer <access_token>` on protected endpoints.
 
-Read the signup code from the local email inbox and send it with the email to `/auth/verify`. Verification returns a message. Login and refresh return Supabase session objects containing access and refresh tokens. Logout revokes the current refresh session. Supabase access tokens can remain valid until their expiry.
+1. Send `email` to `POST /auth/send-code`.
+2. Send `email`, `password`, and the six-digit `code` to `POST /auth/signup`. Passwords contain 8–128 characters. Successful signup returns a message; the account email is already verified.
+3. Log in through `POST /auth/login` to obtain a Supabase session.
+4. Send `name`, `province`, `city`, and `date_of_birth` (`YYYY-MM-DD`, from 1900-01-01 through today) to `POST /users/me/complete-profile`. Its response includes `is_profile_complete: true`. Repeated completion returns HTTP 409. Select roles afterward through `PATCH /users/me`.
+
+Emails are trimmed and lowercased. Codes expire after ten minutes, permit five wrong attempts, and can be resent after sixty seconds. A successful resend replaces the previous code. Codes are stored as email-bound Argon2id hashes and consumed atomically with account/profile creation. Delivery failures preserve the previous code. Existing accounts receive the same send-code success message without an email; signup failures use a generic auth error. Missing email configuration or delivery failure returns HTTP 503.
+
+New profiles have null profile fields and `is_profile_complete: false`. Protected actions require authentication followed by a complete profile; incomplete users receive HTTP 403 with `PROFILE_INCOMPLETE`. Completion and logout require authentication only. Login, refresh, and existing public reads remain available. Profile completion is separate from role selection.
+
+Login and refresh return Supabase session objects containing access and refresh tokens. Logout revokes the current refresh session. Supabase access tokens can remain valid until expiry. The former `/auth/verify` endpoint has been removed.
 
 JSON request and response fields use snake_case. Drizzle uses camelCase. Lists return arrays and accept `limit` (1–100, default 20) and `offset` (default 0). Errors use `{ "error": { "code": "...", "message": "..." } }`.
 
@@ -25,22 +34,23 @@ JSON request and response fields use snake_case. Drizzle uses camelCase. Lists r
 | Method | Path | Access and input |
 | --- | --- | --- |
 | GET | `/health` | Public |
-| POST | `/auth/signup` | Public, registration fields above |
-| POST | `/auth/verify` | Public, `email`, `token` |
+| POST | `/auth/send-code` | Public, `email` |
+| POST | `/auth/signup` | Public, `email`, `password`, `code` |
 | POST | `/auth/login` | Public, `email`, `password` |
 | POST | `/auth/refresh` | Public, `refresh_token` |
 | POST | `/auth/logout` | Signed in |
-| GET | `/users/:id` | Public, excludes birth date |
-| PATCH | `/users/me` | Signed in, optional `name`, `bio`, `province`, `city`, `date_of_birth`, `social_medias`, `role_ids` |
-| POST | `/users/me/image` | Signed in, multipart `image` |
+| GET | `/users/:id` | Public, includes completion flag, excludes birth date |
+| POST | `/users/me/complete-profile` | Signed in with incomplete profile, four required fields above |
+| PATCH | `/users/me` | Complete profile, optional `name`, `bio`, `province`, `city`, `date_of_birth`, `social_medias`, `role_ids` |
+| POST | `/users/me/image` | Complete profile, multipart `image` |
 | GET | `/catalog/roles` | Public |
 | GET | `/catalog/genres` | Public |
 | GET | `/bands` | Public, optional `name`, `genre` UUID, `role` UUID, `is_open`, pagination |
 | GET | `/bands/:id` | Public |
-| POST | `/bands` | Signed in, `name`, optional `description`, `genre_ids`, `leader_role_id`, `open_roles` |
+| POST | `/bands` | Complete profile, `name`, optional `description`, `genre_ids`, `leader_role_id`, `open_roles` |
 | PATCH | `/bands/:id` | Leader, optional `name`, `description`, `genre_ids`, `open_roles`, `is_open` |
 | POST | `/bands/:id/logo` | Leader, multipart `image` |
-| POST | `/applications` | Signed in, `band_id`, `role_id` |
+| POST | `/applications` | Complete profile, `band_id`, `role_id` |
 | GET | `/applications/:id` | Applicant or band leader |
 | GET | `/applications/band/:id` | Leader, pagination |
 | POST | `/applications/:id/accept` | Leader |
@@ -60,9 +70,9 @@ Images accept JPEG, PNG, and WebP up to 5 MB. Cloudinary decodes the image after
 
 - `bun run typecheck`
 - `bun run test:unit`
-- `bun run test:integration` with local Supabase running and `SUPABASE_SERVICE_ROLE_KEY` set in `.env.development` from `bunx supabase status`. This key is only needed by test fixtures.
+- `bun run test:integration` with local Supabase running and `SUPABASE_SERVICE_ROLE_KEY` set in `.env.development` from `bunx supabase status`. This server-only key is also required for registration.
 
-Integration tests create isolated users and remove them afterward. They verify signup rollback, real email-code verification, authorization, privacy, filtering, vacancies, notifications, concurrent decisions, and rollback after a deliberately failed notification insert. Tests refuse non-local database and auth URLs. A test failure may leave test users or test database objects requiring a local reset.
+Integration tests create isolated users and remove them afterward. They mock only Resend delivery, and verify code ownership, expiry, retry limits, concurrent sends/signups, atomic Auth/profile/code rollback, completion gates, authorization, privacy, filtering, vacancies, notifications, concurrent decisions, and rollback after a deliberately failed notification insert. Automated tests never send real email. Tests refuse non-local database and auth URLs. A test failure may leave test users or test database objects requiring a local reset.
 
 ## Migrations and production
 
@@ -70,7 +80,7 @@ Supabase migrations are the executable migration history. Drizzle schema and sna
 
 Copy `.env.production.example` to `.env.production` and fill in the hosted database, Supabase, and Cloudinary values. Use a server-only database connection with permission to access the application tables, and require TLS for hosted Postgres. Application tables enable RLS and revoke direct `anon` and `authenticated` access. Authorization is enforced in the API.
 
-In hosted Supabase, enable email confirmations, configure production SMTP, and install the supplied Indonesian confirmation template. Local CLI settings do not automatically configure hosted Auth. Keep production Auth rate limits appropriate for deployment. Run `bun run start` behind an HTTPS reverse proxy, with the frontend proxying API requests from the same origin. Frontend deployment and hosting are outside this backend implementation.
+In hosted Supabase, disable public user signup before enabling the new backend registration flow. The backend validates its own email code and creates an email-confirmed account through the server-only admin API. Configure `SUPABASE_SERVICE_ROLE_KEY`, `RESEND_API_KEY`, and `RESEND_FROM_EMAIL`; the service-role key must never reach a browser. Local CLI settings do not automatically configure hosted Auth. Keep production Auth rate limits appropriate for deployment. Run `bun run start` behind an HTTPS reverse proxy, with the frontend proxying API requests from the same origin. Frontend deployment and hosting are outside this backend implementation.
 
 ## Demo data
 
@@ -78,7 +88,9 @@ With local Supabase running and its service role key set as
 `SUPABASE_SERVICE_ROLE_KEY` in `.env.development`, run `bun run db:seed:demo`.
 This adds two sample bands, a vacancy, a pending application, and an acceptance
 notification. Re-running the script leaves existing sample bands in their current
-state.
+state. Demo users are created in Auth with empty profiles, then completed explicitly before roles and bands are inserted.
+
+To wipe and restore local catalogs plus demo data, run `bun run db:reset` followed by `bun run db:seed:demo`. Restart local Supabase after changing Auth configuration. Both commands must target local development; no hosted database or Cloudinary asset is reset.
 
 Sign in as `leader@bandfindr.example`, `applicant@bandfindr.example`, or
 `member@bandfindr.example` with the local demo password `BandFindr-Demo-123!`.

@@ -7,6 +7,25 @@ export const userController = new Elysia()
   .get("/:id", ({ params }) => userService.fetch(params.id), {
     params: idParams,
   })
+  .post(
+    "/me/complete-profile",
+    async ({ headers, body }) =>
+      userService.complete(
+        (await authenticate(headers.authorization, false)).userId,
+        body,
+      ),
+    {
+      body: t.Object(
+        {
+          name,
+          province: name,
+          city: name,
+          date_of_birth: t.String({ format: "date" }),
+        },
+        { additionalProperties: false },
+      ),
+    },
+  )
   .patch(
     "/me",
     async ({ headers, body }) =>

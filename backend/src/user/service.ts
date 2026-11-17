@@ -1,7 +1,7 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { users, roleUsers, roles } from "../db/schema";
-import { missing } from "../shared/errors";
+import { conflict, missing } from "../shared/errors";
 export type ProfileUpdate = {
   name?: string;
   bio?: string | null;
@@ -16,6 +16,7 @@ export const userService = {
     const [user] = await db
       .select({
         id: users.id,
+        is_profile_complete: users.isProfileComplete,
         name: users.name,
         bio: users.bio,
         profile_public_id: users.profilePublicId,
@@ -33,6 +34,31 @@ export const userService = {
       .where(eq(roleUsers.userId, id))
       .orderBy(roles.name);
     return { ...user, roles: userRoles };
+  },
+  async complete(
+    id: string,
+    body: {
+      name: string;
+      province: string;
+      city: string;
+      date_of_birth: string;
+    },
+  ) {
+    const { date_of_birth, ...fields } = body;
+    const updated = await db
+      .update(users)
+      .set({
+        ...fields,
+        name: fields.name.trim(),
+        province: fields.province.trim(),
+        city: fields.city.trim(),
+        dateOfBirth: date_of_birth,
+        isProfileComplete: true,
+      })
+      .where(and(eq(users.id, id), eq(users.isProfileComplete, false)))
+      .returning({ id: users.id });
+    if (!updated.length) conflict("Profil sudah dilengkapi.");
+    return userService.fetch(id);
   },
   async update(id: string, body: ProfileUpdate) {
     await db.transaction(async (tx) => {

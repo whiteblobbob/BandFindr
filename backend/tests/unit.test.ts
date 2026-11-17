@@ -30,6 +30,40 @@ describe("HTTP boundaries", () => {
       },
     });
   });
+  test("registration and completion validate their new payloads", async () => {
+    for (const [path, body] of [
+      ["/auth/send-code", { email: "invalid" }],
+      [
+        "/auth/signup",
+        { email: "valid@example.com", password: "password123", code: "12345" },
+      ],
+      [
+        "/auth/signup",
+        { email: "valid@example.com", password: "password123", code: "abcdef" },
+      ],
+      [
+        "/auth/signup",
+        { email: "valid@example.com", password: "short", code: "012345" },
+      ],
+      ["/users/me/complete-profile", { name: "Missing fields" }],
+    ] as const) {
+      const response = await app.handle(
+        new Request(`http://localhost${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+      );
+      expect(response.status).toBe(422);
+    }
+    expect(
+      (
+        await app.handle(
+          new Request("http://localhost/auth/verify", { method: "POST" }),
+        )
+      ).status,
+    ).toBe(404);
+  });
   test("protected routes require a bearer token", async () => {
     for (const path of [
       "/notifications",

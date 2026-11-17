@@ -1,4 +1,4 @@
-import { beforeAll, afterAll, describe, expect, test } from "bun:test";
+import { beforeAll, afterAll, describe, expect, test, spyOn } from "bun:test";
 import { createClient } from "@supabase/supabase-js";
 
 const enabled = process.env.RUN_INTEGRATION === "1";
@@ -8,6 +8,32 @@ suite("local Supabase integration", () => {
   let sql: (typeof import("../src/db"))["connection"];
   let admin: ReturnType<typeof createClient>;
   const createdUsers: string[] = [];
+  const deliveries = new Map<string, string>();
+  let deliveryFailure = false;
+  let authFailure = false;
+  let fetchSpy: ReturnType<typeof spyOn>;
+  let originalFetch: typeof fetch;
+  let config: (typeof import("../src/shared/config"))["config"];
+  async function sendCode(email: string) {
+    const response = await request("/auth/send-code", "POST", { email });
+    expect(response.status).toBe(200);
+    const code = deliveries.get(email.trim().toLowerCase());
+    expect(code).toMatch(/^[0-9]{6}$/);
+    return code!;
+  }
+  async function register(email: string) {
+    const code = await sendCode(email);
+    const response = await request("/auth/signup", "POST", {
+      email,
+      password,
+      code,
+    });
+    expect(response.status).toBe(200);
+    const [user] =
+      await sql`select id from auth.users where email = ${email.trim().toLowerCase()}`;
+    createdUsers.push(user!.id);
+    return { id: user!.id as string, code };
+  }
   const password = "BandFindr-testing-123!";
   const suffix = crypto.randomUUID();
   const fixtures: {
@@ -83,6 +109,39 @@ suite("local Supabase integration", () => {
       throw new Error(
         "Set SUPABASE_SERVICE_ROLE_KEY for integration fixtures.",
       );
+    config = (await import("../src/shared/config")).config;
+    config.resendApiKey = "test-resend-key";
+    config.resendFromEmail = "BandFindr <test@bandfindr.example>";
+    originalFetch = globalThis.fetch;
+    fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+      Object.assign(
+        async (
+          input: Parameters<typeof fetch>[0],
+          init?: Parameters<typeof fetch>[1],
+        ) => {
+          const url = input instanceof Request ? input.url : String(input);
+          if (url === "https://api.resend.com/emails") {
+            const payload = JSON.parse(String(init?.body));
+            expect(init?.method).toBe("POST");
+            expect(new Headers(init?.headers).get("Authorization")).toBe(
+              "Bearer test-resend-key",
+            );
+            expect(payload.from).toBe(config.resendFromEmail);
+            expect(payload.subject).toBe("Kode pendaftaran BandFindr");
+            if (deliveryFailure)
+              return new Response("private provider details", { status: 500 });
+            const code = payload.text.match(/\b[0-9]{6}\b/)?.[0];
+            expect(code).toBeDefined();
+            deliveries.set(payload.to[0], code);
+            return Response.json({ id: crypto.randomUUID() });
+          }
+          if (authFailure && url.endsWith("/auth/v1/admin/users"))
+            return new Response("private auth details", { status: 500 });
+          return originalFetch(input, init);
+        },
+        { preconnect: originalFetch.preconnect },
+      ),
+    );
     app = (await import("../src/app")).app;
     sql = (await import("../src/db")).connection;
     admin = createClient(
@@ -103,7 +162,6 @@ suite("local Supabase integration", () => {
         email,
         password,
         email_confirm: true,
-        user_metadata: profile,
       });
       if (error || !data.user)
         throw error ?? new Error("Fixture creation failed");
@@ -119,6 +177,16 @@ suite("local Supabase integration", () => {
       expect(
         (
           await request(
+            "/users/me/complete-profile",
+            "POST",
+            profile,
+            login.body.access_token,
+          )
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await request(
             "/users/me",
             "PATCH",
             { role_ids: [guitarist, drummer] },
@@ -131,46 +199,151 @@ suite("local Supabase integration", () => {
   afterAll(async () => {
     if (admin)
       for (const id of createdUsers) await admin.auth.admin.deleteUser(id);
-    if (sql) await sql.end();
+    if (sql) {
+      await sql`delete from public.registration_codes where email like ${`%${suffix}%`}`;
+      await sql.end();
+    }
+    fetchSpy?.mockRestore();
   });
-  test("signup trigger rejects missing fields atomically even through Supabase directly", async () => {
-    const email = `invalid-${suffix}@example.com`;
-    const { error } = await admin.auth.admin.createUser({
-      email,
-      password,
-      user_metadata: { name: "Incomplete" },
-    });
-    expect(error).not.toBeNull();
+  test("direct public signup is disabled and admin creation ignores profile metadata", async () => {
+    const email = `direct-${suffix}@example.com`;
+    const direct = createClient(
+      process.env.SUPABASE_URL!,
+      process.env.SUPABASE_ANON_KEY!,
+    );
+    expect(
+      (await direct.auth.signUp({ email, password })).error,
+    ).not.toBeNull();
     expect(
       (await sql`select id from auth.users where email = ${email}`).length,
     ).toBe(0);
+    const { data, error } = await admin.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: { name: "Ignored", is_profile_complete: true },
+    });
+    expect(error).toBeNull();
+    createdUsers.push(data.user!.id);
+    const [row] =
+      await sql`select * from public.users where id = ${data.user!.id}`;
+    expect(row!.is_profile_complete).toBe(false);
+    for (const field of [
+      "name",
+      "province",
+      "city",
+      "date_of_birth",
+      "bio",
+      "profile_public_id",
+      "social_medias",
+    ])
+      expect(row![field]).toBeNull();
+    expect(
+      (
+        await sql`select id from auth.users where id = ${data.user!.id} and email_confirmed_at is not null`
+      ).length,
+    ).toBe(1);
   });
-  test("signup, OTP verification, login, refresh and logout through HTTP", async () => {
+  test("send code, register, login, complete profile, refresh and logout through HTTP", async () => {
     const email = `signup-${suffix}@example.com`;
+    const { id, code } = await register(`  ${email.toUpperCase()}  `);
     expect(
-      (await request("/auth/signup", "POST", { email, password, ...profile }))
-        .status,
-    ).toBe(200);
-    const [user] = await sql`select id from auth.users where email = ${email}`;
-    createdUsers.push(user!.id);
+      (
+        await sql`select email from public.registration_codes where email = ${email}`
+      ).length,
+    ).toBe(0);
     expect(
-      (await request("/auth/login", "POST", { email, password })).status,
+      (await request("/auth/signup", "POST", { email, password, code })).status,
     ).toBe(400);
-    const messages = (await fetch(
-      "http://127.0.0.1:55424/api/v1/messages",
-    ).then((r) => r.json())) as any;
-    const message = messages.messages.find((m: any) =>
-      m.To.some((recipient: any) => recipient.Address === email),
-    );
-    expect(message).toBeDefined();
-    const content = (await fetch(
-      `http://127.0.0.1:55424/api/v1/message/${message.ID}`,
-    ).then((r) => r.json())) as any;
-    const token = `${content.Text} ${content.HTML}`.match(/\b\d{6}\b/)?.[0];
-    expect(token).toBeDefined();
     expect(
-      (await request("/auth/verify", "POST", { email, token })).status,
+      (await request("/auth/verify", "POST", { email, token: code })).status,
+    ).toBe(404);
+    const login = await request("/auth/login", "POST", { email, password });
+    expect(login.status).toBe(200);
+    const token = login.body.access_token;
+    expect((await request(`/users/${id}`)).body.is_profile_complete).toBe(
+      false,
+    );
+    for (const path of [
+      "/health",
+      "/bands",
+      "/catalog/roles",
+      "/catalog/genres",
+      `/users/${id}`,
+    ])
+      expect((await request(path, "GET", undefined, token)).status).toBe(200);
+    const blocked = await request("/notifications", "GET", undefined, token);
+    expect(blocked.status).toBe(403);
+    expect(blocked.body.error.code).toBe("PROFILE_INCOMPLETE");
+    expect(
+      (await request("/users/me", "PATCH", { name: "Bypass" }, token)).status,
+    ).toBe(403);
+    expect(
+      (await request("/users/me/complete-profile", "POST", profile)).status,
+    ).toBe(401);
+    expect(
+      (await request("/users/me/complete-profile", "POST", profile, "invalid"))
+        .status,
+    ).toBe(401);
+    expect(
+      (
+        await request(
+          "/users/me/complete-profile",
+          "POST",
+          { name: "Incomplete" },
+          token,
+        )
+      ).status,
+    ).toBe(422);
+    for (const date_of_birth of ["2999-01-01", "1899-12-31", "2023-02-29"])
+      expect(
+        (
+          await request(
+            "/users/me/complete-profile",
+            "POST",
+            { ...profile, date_of_birth },
+            token,
+          )
+        ).status,
+      ).toBeGreaterThanOrEqual(400);
+    expect((await request(`/users/${id}`)).body.is_profile_complete).toBe(
+      false,
+    );
+    const results = await Promise.all([
+      request("/users/me/complete-profile", "POST", profile, token),
+      request("/users/me/complete-profile", "POST", profile, token),
+    ]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+    const complete = (await request(`/users/${id}`)).body;
+    expect(complete.is_profile_complete).toBe(true);
+    expect(complete.name).toBe(profile.name);
+    expect(complete).not.toHaveProperty("date_of_birth");
+    expect(
+      (await request("/notifications", "GET", undefined, token)).status,
     ).toBe(200);
+    expect(
+      (await request("/users/me/complete-profile", "POST", profile, token))
+        .status,
+    ).toBe(409);
+    expect(
+      (
+        await request("/auth/refresh", "POST", {
+          refresh_token: login.body.refresh_token,
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (await request("/auth/logout", "POST", undefined, token)).status,
+    ).toBe(200);
+    deliveries.delete(email);
+    expect((await request("/auth/send-code", "POST", { email })).status).toBe(
+      200,
+    );
+    expect(deliveries.has(email)).toBe(false);
+  }, 30000);
+  test("incomplete users can refresh and log out", async () => {
+    const email = `logout-${suffix}@example.com`;
+    await register(email);
     const login = await request("/auth/login", "POST", { email, password });
     expect(login.status).toBe(200);
     expect(
@@ -190,11 +363,258 @@ suite("local Supabase integration", () => {
         )
       ).status,
     ).toBe(200);
+  });
+  test("every protected action gates incomplete profiles before business authorization", async () => {
+    const email = `gates-${suffix}@example.com`;
+    const { id } = await register(email);
+    const login = await request("/auth/login", "POST", { email, password });
+    const token = login.body.access_token;
+    const targetId = crypto.randomUUID();
+    const actions: [string, string, unknown?][] = [
+      ["/users/me", "PATCH", {}],
+      [
+        "/bands",
+        "POST",
+        {
+          name: "Blocked",
+          genre_ids: [],
+          leader_role_id: guitarist,
+          open_roles: [],
+        },
+      ],
+      [`/bands/${targetId}`, "PATCH", {}],
+      ["/applications", "POST", { band_id: targetId, role_id: guitarist }],
+      [`/applications/${targetId}`, "GET"],
+      [`/applications/band/${targetId}`, "GET"],
+      [`/applications/${targetId}/accept`, "POST"],
+      [`/applications/${targetId}/reject`, "POST"],
+      ["/notifications", "GET"],
+      [`/notifications/${targetId}/read`, "PATCH"],
+    ];
+    for (const [path, method, body] of actions) {
+      const denied = await request(path, method, body, token);
+      expect(denied.status).toBe(403);
+      expect(denied.body.error.code).toBe("PROFILE_INCOMPLETE");
+      expect((await request(path, method, body, "invalid")).status).toBe(401);
+    }
+    for (const path of ["/users/me/image", `/bands/${targetId}/logo`]) {
+      const body = new FormData();
+      body.set(
+        "image",
+        new File(
+          [
+            Buffer.from(
+              "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS2kAAAAASUVORK5CYII=",
+              "base64",
+            ),
+          ],
+          "image.png",
+          { type: "image/png" },
+        ),
+      );
+      const response = await app.handle(
+        new Request(`http://localhost${path}`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}` },
+          body,
+        }),
+      );
+      expect(response.status).toBe(403);
+      expect(((await response.json()) as any).error.code).toBe(
+        "PROFILE_INCOMPLETE",
+      );
+    }
+    await expect(
+      sql`update public.users set is_profile_complete = true where id = ${id}`,
+    ).rejects.toMatchObject({ code: "23514" });
+  });
+  test("missing email configuration fails safely without creating a code", async () => {
+    const email = `missing-config-${suffix}@example.com`;
+    const key = config.resendApiKey;
+    config.resendApiKey = undefined;
+    try {
+      expect((await request("/auth/send-code", "POST", { email })).status).toBe(
+        503,
+      );
+      expect(
+        (
+          await sql`select email from public.registration_codes where email = ${email}`
+        ).length,
+      ).toBe(0);
+    } finally {
+      config.resendApiKey = key;
+    }
+  });
+  test("codes are hashed, email-bound, limited, expired, and replaced on resend", async () => {
+    const email = `codes-${suffix}@example.com`;
+    const code = await sendCode(email);
+    const [stored] =
+      await sql`select * from public.registration_codes where email = ${email}`;
+    expect(stored!.code_hash).toStartWith("$argon2id$");
     expect(
-      (await request("/auth/verify", "POST", { email, token: "000000" }))
-        .status,
+      await Bun.password.verify(`${email}:${code}`, stored!.code_hash),
+    ).toBe(true);
+    expect(
+      new Date(stored!.expires_at).getTime() -
+        new Date(stored!.sent_at).getTime(),
+    ).toBe(600_000);
+    expect((await request("/auth/send-code", "POST", { email })).status).toBe(
+      429,
+    );
+    expect(
+      (
+        await request("/auth/signup", "POST", {
+          email: `other-${suffix}@example.com`,
+          password,
+          code,
+        })
+      ).status,
     ).toBe(400);
+    const wrong = code === "000000" ? "000001" : "000000";
+    for (let i = 0; i < 5; i++)
+      expect(
+        (
+          await request("/auth/signup", "POST", {
+            email,
+            password,
+            code: wrong,
+          })
+        ).status,
+      ).toBe(400);
+    expect(
+      (
+        await sql`select failed_attempts from public.registration_codes where email = ${email}`
+      )[0]!.failed_attempts,
+    ).toBe(5);
+    expect(
+      (await request("/auth/signup", "POST", { email, password, code })).status,
+    ).toBe(400);
+    await sql`update public.registration_codes set sent_at = now() - interval '61 seconds' where email = ${email}`;
+    const newCode = await sendCode(email);
+    const [replacement] =
+      await sql`select * from public.registration_codes where email = ${email}`;
+    expect(replacement!.code_hash).not.toBe(stored!.code_hash);
+    expect(replacement!.failed_attempts).toBe(0);
+    if (newCode !== code)
+      expect(
+        (await request("/auth/signup", "POST", { email, password, code }))
+          .status,
+      ).toBe(400);
+    await sql`update public.registration_codes set expires_at = now() - interval '1 second' where email = ${email}`;
+    expect(
+      (
+        await request("/auth/signup", "POST", {
+          email,
+          password,
+          code: newCode,
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (await sql`select id from auth.users where email = ${email}`).length,
+    ).toBe(0);
   }, 30000);
+  test("delivery and Auth failures preserve the code and hide provider details", async () => {
+    const email = `failure-${suffix}@example.com`;
+    const code = await sendCode(email);
+    await sql`update public.registration_codes set sent_at = now() - interval '61 seconds' where email = ${email}`;
+    deliveryFailure = true;
+    try {
+      const failed = await request("/auth/send-code", "POST", { email });
+      expect(failed.status).toBe(503);
+      expect(JSON.stringify(failed.body)).not.toContain("private");
+    } finally {
+      deliveryFailure = false;
+    }
+    const [retained] =
+      await sql`select code_hash from public.registration_codes where email = ${email}`;
+    expect(
+      await Bun.password.verify(`${email}:${code}`, retained!.code_hash),
+    ).toBe(true);
+    authFailure = true;
+    try {
+      const failed = await request("/auth/signup", "POST", {
+        email,
+        password,
+        code,
+      });
+      expect(failed.status).toBe(400);
+      expect(JSON.stringify(failed.body)).not.toContain("private");
+    } finally {
+      authFailure = false;
+    }
+    expect(
+      (await sql`select id from auth.users where email = ${email}`).length,
+    ).toBe(0);
+    expect(
+      (
+        await sql`select email from public.registration_codes where email = ${email}`
+      ).length,
+    ).toBe(1);
+    expect(
+      (await request("/auth/signup", "POST", { email, password, code })).status,
+    ).toBe(200);
+    createdUsers.push(
+      (await sql`select id from auth.users where email = ${email}`)[0]!.id,
+    );
+  });
+  test("concurrent sends and signups permit only one successful operation", async () => {
+    const email = `concurrent-${suffix}@example.com`;
+    const sends = await Promise.all([
+      request("/auth/send-code", "POST", { email }),
+      request("/auth/send-code", "POST", { email }),
+    ]);
+    expect(sends.map((r) => r.status).sort()).toEqual([200, 429]);
+    const code = deliveries.get(email);
+    const signups = await Promise.all([
+      request("/auth/signup", "POST", { email, password, code }),
+      request("/auth/signup", "POST", { email, password, code }),
+    ]);
+    expect(signups.map((r) => r.status).sort()).toEqual([200, 400]);
+    const rows = await sql`select id from auth.users where email = ${email}`;
+    expect(rows.length).toBe(1);
+    createdUsers.push(rows[0]!.id);
+    expect(
+      (
+        await sql`select email from public.registration_codes where email = ${email}`
+      ).length,
+    ).toBe(0);
+  });
+  test("trigger failures roll back Auth, profile creation, and code consumption together", async () => {
+    const email = `rollback-${suffix}@example.com`;
+    const code = await sendCode(email);
+    await sql.unsafe(
+      `CREATE FUNCTION public.test_registration_rollback() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.email = '${email}' THEN RAISE EXCEPTION 'test failure'; END IF; RETURN OLD; END $$`,
+    );
+    await sql.unsafe(
+      "CREATE TRIGGER test_registration_rollback BEFORE DELETE ON public.registration_codes FOR EACH ROW EXECUTE FUNCTION public.test_registration_rollback()",
+    );
+    try {
+      expect(
+        (await request("/auth/signup", "POST", { email, password, code }))
+          .status,
+      ).toBe(400);
+      expect(
+        (await sql`select id from auth.users where email = ${email}`).length,
+      ).toBe(0);
+      expect(
+        (
+          await sql`select email from public.registration_codes where email = ${email}`
+        ).length,
+      ).toBe(1);
+    } finally {
+      await sql.unsafe(
+        "DROP TRIGGER test_registration_rollback ON public.registration_codes",
+      );
+      await sql.unsafe("DROP FUNCTION public.test_registration_rollback()");
+    }
+    expect(
+      (await request("/auth/signup", "POST", { email, password, code })).status,
+    ).toBe(200);
+    createdUsers.push(
+      (await sql`select id from auth.users where email = ${email}`)[0]!.id,
+    );
+  });
   test("profile privacy, role selection and public band filters", async () => {
     const response = await request(`/users/${fixtures[0]!.id}`);
     expect(response.body).not.toHaveProperty("date_of_birth");
@@ -838,16 +1258,18 @@ suite("local Supabase integration", () => {
   });
   test("RLS and grants prevent direct anonymous and authenticated data access", async () => {
     for (const token of [process.env.SUPABASE_ANON_KEY!, fixtures[1]!.token]) {
-      const response = await fetch(
-        `${process.env.SUPABASE_URL}/rest/v1/users?select=*`,
-        {
-          headers: {
-            apikey: process.env.SUPABASE_ANON_KEY!,
-            authorization: `Bearer ${token}`,
+      for (const table of ["users", "registration_codes"]) {
+        const response = await fetch(
+          `${process.env.SUPABASE_URL}/rest/v1/${table}?select=*`,
+          {
+            headers: {
+              apikey: process.env.SUPABASE_ANON_KEY!,
+              authorization: `Bearer ${token}`,
+            },
           },
-        },
-      );
-      expect([401, 403]).toContain(response.status);
+        );
+        expect([401, 403]).toContain(response.status);
+      }
     }
   });
 });

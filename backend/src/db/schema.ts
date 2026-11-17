@@ -6,24 +6,39 @@ import {
   boolean,
   integer,
   date,
+  timestamp,
   primaryKey,
   check,
   index,
   unique,
 } from "drizzle-orm/pg-core";
 
-export const users = pgTable("users", {
-  id: uuid().primaryKey(),
-  name: text().notNull(),
-  bio: text(),
-  profilePublicId: text("profile_public_id"),
-  province: text().notNull(),
-  city: text().notNull(),
-  dateOfBirth: date("date_of_birth").notNull(),
-  socialMedias: text("social_medias")
-    .array()
-    .notNull()
-    .default(sql`'{}'::text[]`),
+export const users = pgTable(
+  "users",
+  {
+    id: uuid().primaryKey(),
+    name: text(),
+    bio: text(),
+    profilePublicId: text("profile_public_id"),
+    province: text(),
+    city: text(),
+    dateOfBirth: date("date_of_birth"),
+    socialMedias: text("social_medias").array(),
+    isProfileComplete: boolean("is_profile_complete").notNull().default(false),
+  },
+  (t) => [
+    check(
+      "user_profile_complete",
+      sql`NOT ${t.isProfileComplete} OR (${t.name} IS NOT NULL AND ${t.province} IS NOT NULL AND ${t.city} IS NOT NULL AND ${t.dateOfBirth} IS NOT NULL)`,
+    ),
+  ],
+);
+export const registrationCodes = pgTable("registration_codes", {
+  email: text().primaryKey(),
+  codeHash: text("code_hash").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  sentAt: timestamp("sent_at", { withTimezone: true }).notNull(),
+  failedAttempts: integer("failed_attempts").notNull().default(0),
 });
 export const roles = pgTable("roles", {
   id: uuid().defaultRandom().primaryKey(),
